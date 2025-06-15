@@ -7,20 +7,18 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-# --- Konfiguracja ---
+# --- Konfiguracja (bez zmian) ---
 DRIVE_FILE_NAME = "historia_czatu_drive.txt"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# --- NOWA, OSTATECZNA FUNKCJA LOGOWANIA DLA "ROBOTA" ---
+# --- NOWA, OSTATECZNA FUNKCJA LOGOWANIA DLA "ROBOTA" (bez zmian) ---
 @st.cache_resource
 def get_drive_service():
     try:
-        # Tworzymy słownik z danymi logowania, pobierając każdą wartość osobno z sekretów
         creds_info = {
             "type": st.secrets.gcp_service_account.type,
             "project_id": st.secrets.gcp_service_account.project_id,
             "private_key_id": st.secrets.gcp_service_account.private_key_id,
-            # Ta linijka naprawia problem ze znakami nowej linii w kluczu prywatnym
             "private_key": st.secrets.gcp_service_account.private_key.replace('\\n', '\n'),
             "client_email": st.secrets.gcp_service_account.client_email,
             "client_id": st.secrets.gcp_service_account.client_id,
@@ -54,18 +52,50 @@ def download_history(service, file_id):
         while not done:
             status, done = downloader.next_chunk()
         return fh.getvalue().decode('utf-8')
-    except HttpError: return ""
+    except HttpError:
+        # Jeśli plik nie istnieje lub jest inny błąd HTTP, zwróć pusty string
+        # To jest kluczowe, aby funkcja `upload_history` mogła dodać nową treść
+        return ""
 
-def upload_history(service, file_id, file_name, content):
-    media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain', resumable=True)
-    if file_id:
-        service.files().update(fileId=file_id, media_body=media).execute()
-    else:
-        file_metadata = {'name': file_name}
-        response = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        st.session_state.file_id = response.get('id')
+def upload_history(service, file_id, file_name, new_content_to_append):
+    """
+    Funkcja aktualizuje historię czatu na Google Drive.
+    Jeśli plik istnieje, pobiera jego zawartość, dopisuje nową treść i wysyła z powrotem.
+    Jeśli plik nie istnieje, tworzy nowy z podaną treścią.
+    """
+    try:
+        existing_content = ""
+        if file_id:
+            # 1. Pobierz istniejącą zawartość pliku
+            existing_content = download_history(service, file_id)
 
-# --- Główna logika aplikacji Streamlit ---
+        # 2. Dopisz nową treść do istniejącej
+        # Zmieniamy sposób tworzenia full_history_text, aby dopisywać tylko ostatnią turę rozmowy
+        # a nie całą historię za każdym razem, bo to prowadzi do duplikacji.
+        # W funkcji chat_input będziemy przekazywać tylko tę nową, ostatnią turę.
+        updated_content = existing_content + new_content_to_append
+
+        media = MediaIoBaseUpload(io.BytesIO(updated_content.encode('utf-8')),
+                                  mimetype='text/plain',
+                                  resumable=True)
+
+        if file_id:
+            # Jeśli plik istnieje, zaktualizuj go z nową, dopisaną treścią
+            service.files().update(fileId=file_id, media_body=media).execute()
+            st.write(f"Zaktualizowano plik na Dysku Google (ID: {file_id})")
+        else:
+            # Jeśli plik nie istnieje, utwórz go
+            file_metadata = {'name': file_name, 'mimeType': 'text/plain'}
+            response = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            st.session_state.file_id = response.get('id')
+            st.write(f"Utworzono nowy plik na Dysku Google (ID: {st.session_state.file_id})")
+
+    except HttpError as error:
+        st.error(f"Wystąpił błąd podczas operacji na Google Drive: {error}")
+    except Exception as e:
+        st.error(f"Wystąpił nieoczekiwany błąd podczas przesyłania historii: {e}")
+
+# --- Główna logika aplikacji Streamlit (zmiany tylko w sekcji `st.chat_input`) ---
 st.set_page_config(page_title="Gemini z Pamięcią", page_icon="🧠")
 st.title("🧠 Gemini z Pamięcią")
 st.caption("Twoja prywatna rozmowa z AI, zapisywana na Twoim Dysku Google.")
@@ -102,8 +132,10 @@ if "history_loaded" not in st.session_state:
 
 if "gemini_chat" not in st.session_state:
     model = genai.GenerativeModel('gemini-1.5-flash')
+    # Upewnij się, że historia do Gemini jest poprawnie formatowana
     gemini_history = [{'role': 'user' if msg['role'] == 'user' else 'model', 'parts': [msg['content']]} for msg in st.session_state.messages]
     st.session_state.gemini_chat = model.start_chat(history=gemini_history)
+
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -120,14 +152,20 @@ if prompt := st.chat_input("Napisz coś..."):
                 response = st.session_state.gemini_chat.send_message(prompt)
                 st.markdown(response.text)
                 st.session_state.messages.append({"role": "assistant", "content": response.text})
-                full_history_text = ""
-                user_msg, assistant_msg = None, None
-                for msg in st.session_state.messages:
-                    if msg["role"] == "user": user_msg = msg["content"]
-                    elif msg["role"] == "assistant":
-                        assistant_msg = msg["content"]
-                        full_history_text += f"Ty: {user_msg}\n\nGemini: {assistant_msg}\n\n\n"
-                upload_history(st.session_state.drive_service, st.session_state.file_id, DRIVE_FILE_NAME, full_history_text)
+
+                # --- KLUCZOWA ZMIANA TUTAJ: Przygotowanie tylko ostatniej tury rozmowy ---
+                # Pamiętamy, że 'messages' zawiera już ostatnią odpowiedź Geminiego
+                last_user_msg = prompt
+                last_assistant_msg = response.text
+                
+                # Formatujemy tylko ostatnią turę, którą chcemy dopisać
+                latest_turn_text = f"Ty: {last_user_msg}\n\nGemini: {last_assistant_msg}\n\n\n"
+
+                # Wywołaj upload_history z nową, ostatnią turą rozmowy
+                upload_history(st.session_state.drive_service, st.session_state.file_id, DRIVE_FILE_NAME, latest_turn_text)
+
+                # Opcjonalnie: upewnij się, że file_id jest aktualne, jeśli plik został dopiero co utworzony
                 if not st.session_state.file_id:
-                     st.session_state.file_id = get_file_id(st.session_state.drive_service, DRIVE_FILE_NAME)
-            except Exception as e: st.error(f"Wystąpił błąd: {e}")
+                    st.session_state.file_id = get_file_id(st.session_state.drive_service, DRIVE_FILE_NAME)
+            except Exception as e:
+                st.error(f"Wystąpił błąd: {e}")
