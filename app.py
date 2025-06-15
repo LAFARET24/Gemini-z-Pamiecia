@@ -1,6 +1,5 @@
 import os
 import io
-import json
 import streamlit as st
 import google.generativeai as genai
 from google.oauth2 import service_account
@@ -12,21 +11,34 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 DRIVE_FILE_NAME = "historia_czatu_drive.txt"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# --- NOWA, PROSTSZA FUNKCJA LOGOWANIA DLA "ROBOTA" ---
+# --- NOWA, OSTATECZNA FUNKCJA LOGOWANIA DLA "ROBOTA" ---
 @st.cache_resource
 def get_drive_service():
     try:
-        # Ładujemy dane z sekretów Streamlit
-        creds_json_str = st.secrets["GCP_CREDENTIALS"]
-        creds_info = json.loads(creds_json_str)
+        # Tworzymy słownik z danymi logowania, pobierając każdą wartość osobno z sekretów
+        creds_info = {
+            "type": st.secrets.gcp_service_account.type,
+            "project_id": st.secrets.gcp_service_account.project_id,
+            "private_key_id": st.secrets.gcp_service_account.private_key_id,
+            # Ta linijka naprawia problem ze znakami nowej linii w kluczu prywatnym
+            "private_key": st.secrets.gcp_service_account.private_key.replace('\\n', '\n'),
+            "client_email": st.secrets.gcp_service_account.client_email,
+            "client_id": st.secrets.gcp_service_account.client_id,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": st.secrets.gcp_service_account.client_x509_cert_url,
+            "universe_domain": "googleapis.com"
+        }
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         service = build("drive", "v3", credentials=creds)
         return service
     except Exception as e:
-        st.error(f"Błąd podczas łączenia z Google Drive przez Service Account: {e}")
+        st.error(f"Błąd podczas łączenia z Google Drive: {e}")
+        st.error("Sprawdź, czy wszystkie wartości w sekcji [gcp_service_account] w 'Secrets' są poprawnie wklejone.")
         return None
 
-# --- Funkcje do obsługi plików (bez większych zmian) ---
+# Reszta funkcji bez zmian...
 def get_file_id(service, file_name):
     query = f"name='{file_name}' and trashed=false"
     response = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
@@ -42,8 +54,7 @@ def download_history(service, file_id):
         while not done:
             status, done = downloader.next_chunk()
         return fh.getvalue().decode('utf-8')
-    except HttpError:
-        return ""
+    except HttpError: return ""
 
 def upload_history(service, file_id, file_name, content):
     media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain', resumable=True)
@@ -60,13 +71,12 @@ st.title("🧠 Gemini z Pamięcią")
 st.caption("Twoja prywatna rozmowa z AI, zapisywana na Twoim Dysku Google.")
 
 try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    genai.configure(api_key=st.secrets.GEMINI_API_KEY)
 except Exception as e:
     st.error(f"Błąd konfiguracji Gemini API. Sprawdź swój klucz w Secrets. Błąd: {e}")
     st.stop()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if "messages" not in st.session_state: st.session_state.messages = []
 if "history_loaded" not in st.session_state:
     with st.spinner("Łączenie i wczytywanie pamięci z Dysku Google..."):
         drive_service = get_drive_service()
