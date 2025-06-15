@@ -114,7 +114,7 @@ st.set_page_config(
 
 # --- ELEMENTY WIZUALNE: LOGO i BANER ---
 st.image("moje_logo.png", width=48) # Wyświetlamy logo na stronie, ustawiając szerokość na 48px
-st.image("baner.png", width=200, height=130) # Wyświetlamy baner, ustawiając konkretne wymiary
+st.image("baner.png", width=200) # Wyświetlamy baner, ustawiając szerokość na 200px (wysokość zostanie dopasowana)
 
 # Tytuł i opis aplikacji
 st.title("🧠 Gemini z Pamięcią")
