@@ -13,6 +13,12 @@ import time
 # Importowanie biblioteki do obsługi WebRTC (nagrywanie mikrofonu)
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
+# Potrzebujemy pydub do konwersji surowych bajtów audio na WebM/WAV, jeśli to konieczne
+# Pydub wymaga zainstalowanego ffmpeg na systemie (Streamlit Cloud to ma)
+# pip install pydub
+from pydub import AudioSegment
+from pydub.playback import play # Opcjonalnie do testowania lokalnie
+
 # --- Konfiguracja Aplikacji i Streamlit ---
 st.set_page_config(page_title="Gemini z Pamięcią i Notatkami", page_icon="🎤", layout="wide")
 
@@ -165,7 +171,7 @@ for message in st.session_state.messages:
         if "audio_response" in message and message["audio_response"]:
             st.audio(message["audio_response"]) 
 
-# --- OBSŁUGA GŁOSU I TEKSTU (ZMODYFIKOWANA DLA STREAMLIT-WEBRTC I SKŁADNI) ---
+# --- OBSŁUGA GŁOSU I TEKSTU (ZMODYFIKOWANA DLA STREAMLIT-WEBRTC Z GŁĘBSZĄ OBRÓBKĄ AUDIO) ---
 st.markdown("---")
 st.write("Użyj przycisków Start/Stop mikrofonu lub wpisz tekst poniżej:")
 
@@ -180,18 +186,80 @@ webrtc_ctx = webrtc_streamer(
 )
 
 # Inicjalizacja bufora audio w sesji
-if "audio_buffer" not in st.session_state:
-    st.session_state.audio_buffer = io.BytesIO()
-if "webrtc_last_audio_data" not in st.session_state:
-    st.session_state.webrtc_last_audio_data = None
+if "audio_buffer_webrtc" not in st.session_state:
+    st.session_state.audio_buffer_webrtc = io.BytesIO()
+if "webrtc_last_audio_hash" not in st.session_state: # Użyjemy hasha do unikalnego identyfikowania nagrań
+    st.session_state.webrtc_last_audio_hash = None
 
+
+# Zbiera dane audio z mikrofonu, gdy nagrywanie jest aktywne
+if webrtc_ctx.state.playing and webrtc_ctx.audio_receiver:
+    try:
+        # Zbieramy ramki audio i zapisujemy je do bufora
+        # webrtc_ctx.audio_receiver.get_queued_frames() zwraca listę AudioFrame
+        # Każda AudioFrame zawiera surowe bajty PCM.
+        frames = webrtc_ctx.audio_receiver.get_queued_frames()
+        if frames:
+            for frame in frames:
+                # 'to_ndarray()' konwertuje ramkę na numpy array, 'tobytes()' na surowe bajty
+                st.session_state.audio_buffer_webrtc.write(frame.to_ndarray().tobytes())
+            # st.write(f"Zebrałem {st.session_state.audio_buffer_webrtc.tell()} bajtów") # Debugowanie
+    except Exception as e:
+        st.warning(f"Błąd podczas zbierania ramek audio WebRTC: {e}")
+
+# Jeśli użytkownik zatrzymał nagrywanie ORAZ bufor zawiera dane, przetwarzamy je
+# webrtc_ctx.state.playing == False oznacza, że nagrywanie zostało zatrzymane
+# audio_buffer_webrtc.tell() > 0 sprawdza, czy w ogóle coś zostało nagrane
+if webrtc_ctx.state.playing == False and st.session_state.audio_buffer_webrtc.tell() > 0:
+    # Pobieramy zebrane surowe bajty audio (PCM)
+    raw_audio_bytes = st.session_state.audio_buffer_webrtc.getvalue()
+    
+    # Haszujemy bajty, aby unikalnie zidentyfikować to nagranie i przetworzyć tylko raz
+    import hashlib
+    current_audio_hash = hashlib.md5(raw_audio_bytes).hexdigest()
+
+    if st.session_state.webrtc_last_audio_hash != current_audio_hash:
+        st.session_state.webrtc_last_audio_hash = current_audio_hash
+        
+        st.info("Konwertuję nagranie do formatu WebM (Opus) i transkrybuję...")
+        try:
+            # Konwersja surowych bajtów PCM do formatu WebM (Opus) za pomocą pydub
+            # Zakładamy domyślne parametry (np. 48kHz, mono), które są standardowe dla WebRTC
+            audio_segment = AudioSegment(
+                raw_audio_bytes, 
+                sample_width=frame.sample_width, # Użyj sample_width z ostatniej ramki
+                frame_rate=frame.sample_rate,   # Użyj sample_rate z ostatniej ramki
+                channels=frame.channels         # Użyj channels z ostatniej ramki
+            )
+            
+            # Eksport do WebM (Opus) do obiektu BytesIO
+            webm_audio_bytes_io = io.BytesIO()
+            audio_segment.export(webm_audio_bytes_io, format="webm", codec="libopus")
+            webm_audio_bytes = webm_audio_bytes_io.getvalue()
+
+            # Przetwarzamy przekonwertowane audio
+            process_prompt("audio", webm_audio_bytes)
+            
+        except Exception as e:
+            st.error(f"Błąd podczas konwersji audio (pydub/ffmpeg): {e}")
+            st.session_state.messages.append({"role": "user", "content": "🎤 *Błąd konwersji audio*"})
+            # Wyczyść bufor nawet po błędzie konwersji
+            st.session_state.audio_buffer_webrtc = io.BytesIO() 
+            st.rerun() # Wymuszenie reroll
+
+    # Wyczyść bufor po przetworzeniu, niezależnie od wyniku
+    st.session_state.audio_buffer_webrtc = io.BytesIO() 
+    # Opcjonalnie: st.rerun() jest już wywoływane w process_prompt
+
+# Pole do wpisywania tekstu
+text_prompt = st.text_input("...lub wpisz swoje pytanie tutaj:", key="text_input_bottom")
 
 # --- Funkcja pomocnicza do przetwarzania promptu (głosowego/tekstowego) ---
 def process_prompt(prompt_type, input_data):
     user_prompt_content = None
 
     if prompt_type == "audio" and input_data:
-        st.info("Przetwarzam Twoje nagranie i transkrybuję...")
+        # st.info("Przetwarzam Twoje nagranie i transkrybuję...") # Już wyświetlone wcześniej
         try:
             # Format audio z webrtc_streamer to WebM (Opus)
             audio_file_data = {"mime_type": "audio/webm", "data": input_data} 
@@ -261,31 +329,12 @@ def process_prompt(prompt_type, input_data):
         # st.rerun() jest wywoływane przez webrtc_ctx.audio_receiver.last_buffered_audio
         # lub po wysłaniu promptu tekstowego.
         st.session_state.text_input = "" 
-        # Czasem Streamlit sam odświeża, ale reroll jest bardziej pewny.
         
 # --- Wywoływanie funkcji przetwarzającej na podstawie akcji użytkownika ---
 
-# Pole do wpisywania tekstu
-text_prompt = st.text_input("...lub wpisz swoje pytanie tutaj:", key="text_input_bottom") # Zmieniono key, żeby uniknąć konfliktu
-
-# Jeśli użytkownik wprowadził tekst i nacisnął Enter
-if text_prompt: # Ta linia teraz jest głównym ifem dla tekstu
+# Jeśli użytkownik wprowadził tekst i nacisnął Enter (przeniesiono na koniec, aby nie kolidowało)
+if text_prompt:
     if "last_text_prompt" not in st.session_state or st.session_state.last_text_prompt != text_prompt:
         st.session_state.last_text_prompt = text_prompt
         process_prompt("text", text_prompt)
-        st.rerun() # Wymuszenie reroll po wprowadzeniu tekstu
-
-# Jeśli użytkownik zatrzymał nagrywanie I mamy dane audio, przetwarzamy je
-# webrtc_ctx.state.playing == False oznacza, że nagrywanie zostało zatrzymane
-# Sprawdzamy, czy otrzymaliśmy jakieś dane audio po zatrzymaniu
-if webrtc_ctx.state.playing == False and webrtc_ctx.audio_receiver and webrtc_ctx.audio_receiver.last_buffered_audio is not None:
-    audio_bytes_from_webrtc = webrtc_ctx.audio_receiver.last_buffered_audio
-    
-    # Resetujemy stan po przetworzeniu, aby nie uruchamiać się ponownie przy kolejnym rerollu
-    webrtc_ctx.audio_receiver.last_buffered_audio = None 
-    
-    # Flaga do jednokrotnego przetwarzania
-    if st.session_state.webrtc_last_audio_data != audio_bytes_from_webrtc:
-        st.session_state.webrtc_last_audio_data = audio_bytes_from_webrtc
-        process_prompt("audio", audio_bytes_from_webrtc)
-        st.rerun() # Wymuszenie reroll po przetworzeniu audio
+        st.rerun()
