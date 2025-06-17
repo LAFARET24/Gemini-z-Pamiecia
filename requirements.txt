@@ -2,4 +2,14 @@ streamlit
 google-generativeai
 google-api-python-client
 google-auth-oauthlib
-streamlit-audiorecorder
+gtts
+streamlit-webrtc
+aioice # Zależność streamlit-webrtc
+aiortc # Zależność streamlit-webrtc
+av # Zależność aiortc
+cffi # Zależność aiortc
+cryptography # Zależność aiortc
+google-crc32c # Zależność aiortc
+pyee # Zależność aiortc
+pylibsrtp # Zależność aiortc
+pyopenssl # Zależność aiortc
